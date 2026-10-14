@@ -1,0 +1,182 @@
+# Sealed build of the jquery 1.11.1 npm artifact (build-and-pack only; the
+# tests run on Travis, see .travis.yml).
+#
+# The published jquery-1.11.1.tgz is `npm pack` of this repository after
+# build/release.js generateArtifacts ran: `grunt` regenerated dist/jquery.js,
+# dist/jquery.min.js and dist/jquery.min.map, and makeReleaseCopies() wrote
+# the dist/cdn/ copies. This workflow repeats both inside node:0.10.48 with
+# the npm registry time machine, then packs the tree with npm.
+name: seal-build
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write build scripts
+        run: |
+          mkdir -p "$RUNNER_TEMP/seal"
+          cat > "$RUNNER_TEMP/seal/seal-build.sh" <<'SEAL_EOF'
+          #!/bin/bash
+          # Runs inside node:0.10.48 (Node 0.10.48 / npm 2.15.1). Phase "build":
+          # regenerate the three tracked dist/ files exactly as build/release.js
+          # generateArtifacts does (grunt, then makeReleaseCopies). Phase "pack":
+          # npm pack a copy of the tree.
+          set -euo pipefail
+
+          TM_REGISTRY='https://time-machines-npm.sealsecurity.io/'
+          TM_TOKEN='2014-05-01T18:05:32.863Z'
+          # Build stamp of the release, as recorded in the tracked dist/jquery.js header.
+          RELEASE_DATE='2014-05-01T17:42Z'
+          RELEASE_YEAR='2014'
+
+          case "$1" in
+          build)
+            cd /src
+            node --version
+            npm --version
+            # Registry time machine (npm 2 ignores credentials embedded in the URL)
+            npm config set registry "$TM_REGISTRY"
+            npm config set //time-machines-npm.sealsecurity.io/:_authToken "$TM_TOKEN"
+            npm config set always-auth true
+            unset COMMIT
+            # Pin the build clock for this run only (both files are restored below,
+            # and neither ships in the package):
+            # - build/tasks/build.js stamps @DATE from new Date();
+            # - the uglify banner in Gruntfile.js takes its year from grunt.template.today().
+            cp build/tasks/build.js /tmp/build.js.tagged
+            cp Gruntfile.js /tmp/Gruntfile.js.tagged
+            sed -i "s|( new Date() )\.toISOString().*\$|\"$RELEASE_DATE\" );|" build/tasks/build.js
+            grep -qF ".replace( /@DATE/g, \"$RELEASE_DATE\" );" build/tasks/build.js
+            sed -i "s|<%= grunt.template.today('yyyy') %>|$RELEASE_YEAR|" Gruntfile.js
+            grep -qF "\"(c) 2005, $RELEASE_YEAR jQuery Foundation, Inc. | \" +" Gruntfile.js
+            npm install
+            ./node_modules/.bin/grunt
+            cp /tmp/build.js.tagged build/tasks/build.js
+            cp /tmp/Gruntfile.js.tagged Gruntfile.js
+            # build/release.js makeReleaseCopies()
+            node /seal/make-release-copies.js
+            ls -l dist dist/cdn
+            chown -R "$HOST_UID:$HOST_GID" /src/dist /src/node_modules /src/build
+            ;;
+          pack)
+            STAGE=/seal/stage
+            PKG="$STAGE/package"
+            rm -rf "$STAGE"
+            mkdir -p "$PKG"
+            # Stage the tree without the fork-only files (and .git / node_modules),
+            # so the shipped .npmignore stays exactly upstream's.
+            tar -C /src \
+              --exclude=./.git --exclude=./node_modules --exclude=./.github \
+              --exclude=./seal-qunit-runner.js --exclude=./seal-out \
+              -cf - . | tar -C "$PKG" -xf -
+            cd "$STAGE"
+            npm --version
+            npm pack ./package
+            chown -R "$HOST_UID:$HOST_GID" "$STAGE"
+            ;;
+          *)
+            echo "usage: $0 build|pack" >&2
+            exit 2
+            ;;
+          esac
+          SEAL_EOF
+          cat > "$RUNNER_TEMP/seal/make-release-copies.js" <<'SEAL_EOF'
+          // Mirrors makeReleaseCopies() in build/release.js (stable release, so
+          // every copy is made; shelljs replaced by fs). Run from the repo root.
+          var fs = require( "fs" ),
+            version = JSON.parse( fs.readFileSync( "package.json", "utf8" ) ).version,
+            devFile = "dist/jquery.js",
+            minFile = "dist/jquery.min.js",
+            mapFile = "dist/jquery.min.map",
+            cdnFolder = "dist/cdn",
+            releaseFiles = {
+              "jquery-VER.js": devFile,
+              "jquery-VER.min.js": minFile,
+              "jquery-VER.min.map": mapFile,
+              "jquery.js": devFile,
+              "jquery.min.js": minFile,
+              "jquery.min.map": mapFile,
+              "jquery-latest.js": devFile,
+              "jquery-latest.min.js": minFile,
+              "jquery-latest.min.map": mapFile
+            };
+
+          if ( !fs.existsSync( cdnFolder ) ) {
+            fs.mkdirSync( cdnFolder );
+          }
+
+          Object.keys( releaseFiles ).forEach( function( key ) {
+            var text,
+              builtFile = releaseFiles[ key ],
+              unpathedFile = key.replace( /VER/g, version ),
+              releaseFile = cdnFolder + "/" + unpathedFile;
+
+            if ( /\.map$/.test( releaseFile ) ) {
+              // "file":"jquery.min.js","sources":["jquery.js"] -> the copy's names
+              text = fs.readFileSync( builtFile, "utf8" )
+                .replace( /"file":"([^"]+)","sources":\["([^"]+)"\]/,
+                  "\"file\":\"" + unpathedFile.replace( /\.min\.map/, ".min.js" ) +
+                  "\",\"sources\":[\"" + unpathedFile.replace( /\.min\.map/, ".js" ) + "\"]" );
+              fs.writeFileSync( releaseFile, text );
+            } else if ( /\.min\.js$/.test( releaseFile ) ) {
+              // Remove the source map comment
+              text = fs.readFileSync( builtFile, "utf8" )
+                .replace( /\/\/# sourceMappingURL=\S+/, "" );
+              fs.writeFileSync( releaseFile, text );
+            } else if ( builtFile !== releaseFile ) {
+              fs.writeFileSync( releaseFile, fs.readFileSync( builtFile ) );
+            }
+            console.log( "Created " + releaseFile );
+          } );
+          SEAL_EOF
+
+      - name: Build dist (node:0.10.48)
+        run: |
+          docker run --rm \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/src" -v "$RUNNER_TEMP/seal:/seal" -w /src \
+            node:0.10.48 bash /seal/seal-build.sh build
+
+      # Informative only: on the unmodified 1.11.1 sources the regenerated
+      # dist/ files are expected to equal the tracked release files; once src/
+      # carries patches they legitimately differ.
+      - name: Compare regenerated dist with the tracked release files
+        run: |
+          for f in dist/jquery.js dist/jquery.min.js dist/jquery.min.map; do
+            if git show "HEAD:$f" | cmp -s - "$f"; then
+              echo "MATCH    $f ($(wc -c < "$f") bytes)"
+            else
+              echo "DIFFERS  $f (tracked $(git show "HEAD:$f" | wc -c) bytes, regenerated $(wc -c < "$f") bytes)"
+            fi
+          done
+
+      - name: npm pack (npm 2.15.1)
+        run: |
+          docker run --rm \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/seal:/seal" -w /src \
+            node:0.10.48 bash /seal/seal-build.sh pack
+          mkdir -p seal-out
+          mv "$RUNNER_TEMP/seal/stage/jquery-1.11.1.tgz" seal-out/jquery-1.11.1.tgz
+          ls -l seal-out/jquery-1.11.1.tgz
+          tar tzvf seal-out/jquery-1.11.1.tgz
+          echo "$(tar tzf seal-out/jquery-1.11.1.tgz | wc -l) files"
+          if tar tzf seal-out/jquery-1.11.1.tgz | grep -E '^package/(\.github/|seal-qunit-runner\.js$|node_modules/|\.travis\.yml$|test/|build/)'; then
+            echo "unexpected files in the tarball" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jquery-npm-tgz
+          path: seal-out/jquery-1.11.1.tgz
+          if-no-files-found: error
